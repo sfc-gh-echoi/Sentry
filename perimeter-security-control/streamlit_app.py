@@ -1,4 +1,8 @@
-"""This is a small rewrite of the original app that is focused on getting all code into a single file."""
+###############################################################
+##
+## User Management Utility
+##
+###############################################################
 
 import itertools
 import re
@@ -18,7 +22,7 @@ from toolz.curried import pluck as cpluck
 
 st.set_page_config(layout="wide")
 # Connection short-circuits in SiS, creating the session immediately
-session = st.connection("securitylab2", type="snowflake").session()
+session = st.connection("Security Applied Field Engineering", type="snowflake").session()
 
 
 def user_management():
@@ -37,50 +41,59 @@ def user_management():
         - Changing multiselect resets the selection
     """
     query = """
-    WITH last_authentication_method AS (
-    SELECT
-        user_name,
-        first_authentication_factor AS auth_method,
-        count(*) AS num_of_times,
-        max(event_timestamp) AS last_time_used
+WITH last_authentication_method AS (
+SELECT
+    user_name,
+    first_authentication_factor AS auth_method,
+    count(*) AS num_of_times,
+    max(event_timestamp) AS last_time_used
 
-    FROM snowflake.account_usage.login_history
-    WHERE client_ip != '0.0.0.0'
-    AND is_success = 'YES'
-    GROUP BY 1, 2 ORDER BY 1, 2
-    )
-    SELECT
-        name,
-        type,
-        default_role,
-        disabled,
-        has_password,
-        password_last_set_time,
-        has_rsa_public_key,
-        has_mfa,
-        snowflake_lock,
-        saml.num_of_times saml_num_of_times,
-        saml.last_time_used saml_last_time_used,
-        keypair.num_of_times keypair_num_of_times,
-        keypair.last_time_used keypair_last_time_used,
-        oauth.num_of_times oauth_num_of_times,
-        oauth.last_time_used oauth_last_time_used
-    FROM
-        snowflake.account_usage.users u
-        LEFT JOIN last_authentication_method saml
-            ON
-                u.name = saml.user_name
-                AND saml.auth_method = 'SAML2_ASSERTION'
-        LEFT JOIN last_authentication_method keypair
-            ON
-                u.name = keypair.user_name
-                AND keypair.auth_method = 'RSA_KEYPAIR'
-        LEFT JOIN last_authentication_method oauth
-            ON
-                u.name = oauth.user_name
-                AND oauth.auth_method = 'OAUTH_ACCESS_TOKEN'
-    WHERE
+FROM snowflake.account_usage.login_history
+WHERE client_ip != '0.0.0.0'
+AND is_success = 'YES'
+GROUP BY 1, 2
+),
+user_network_policy as (
+select user_name,
+'CREATE NETWORK POLICY ' || translate(user_name, '@+.', '___') || '_POLICY ALLOWED_IP_LIST=(''' ||
+listagg(distinct client_ip, ''',''') within group (order by client_ip) || ''');' as run_these
+from snowflake.account_usage.login_history
+where client_ip != '0.0.0.0' and is_success = 'YES'
+group by user_name
+)
+SELECT
+    name,
+    login_name,
+    email,
+    type,
+    default_role,
+    disabled,
+    has_password,
+    password_last_set_time,
+    last_success_login,
+    has_rsa_public_key,
+    has_mfa,
+    snowflake_lock,
+    owner,
+    saml.num_of_times saml_num_of_times,
+    saml.last_time_used saml_last_time_used,
+    keypair.num_of_times keypair_num_of_times,
+    keypair.last_time_used keypair_last_time_used,
+    oauth.num_of_times oauth_num_of_times,
+    oauth.last_time_used oauth_last_time_used,
+    nvl(nvl(unetpol.policy_name, anetpol.policy_name), run_these) as policy_name_or_possible_policy,
+    run_these as possible_policy
+FROM
+    snowflake.account_usage.users u
+    LEFT JOIN last_authentication_method saml ON u.name = saml.user_name AND saml.auth_method = 'SAML2_ASSERTION'
+    LEFT JOIN last_authentication_method keypair ON u.name = keypair.user_name AND keypair.auth_method = 'RSA_KEYPAIR'
+    LEFT JOIN last_authentication_method oauth ON u.name = oauth.user_name AND oauth.auth_method = 'OAUTH_ACCESS_TOKEN'
+    LEFT JOIN snowflake.account_usage.policy_references unetpol ON NAME = unetpol.ref_entity_name AND unetpol.policy_kind = 'NETWORK_POLICY' AND unetpol.ref_entity_domain = 'USER'
+    left join snowflake.account_usage.policy_references anetpol on anetpol.policy_kind = 'NETWORK_POLICY' and anetpol.ref_entity_domain = 'ACCOUNT'
+    left join user_network_policy pol on u.name = pol.user_name 
+    WHERE 
         1 = 1
+        and u.deleted_on is null and (u.type != 'SNOWFLAKE_SERVICE' or u.type is null)
         NEEDLE
     ORDER BY has_password = true DESC, password_last_set_time;
     """
@@ -116,11 +129,7 @@ def user_management():
                 applied_filters = filters
 
             applied_filters = pipe(
-                applied_filters,
-                cmap(asdict),
-                cpluck("rule"),
-                cmap(lambda it: f"AND {it}"),
-                "\n ".join,
+                applied_filters, cmap(asdict), cpluck("rule"), cmap(lambda it: f"AND {it}"), "\n ".join
             )
 
             final_query = re.sub("NEEDLE", applied_filters, query)
@@ -139,15 +148,9 @@ def user_management():
             btn_label=f"Set '{future_user_type}' user type",
         )
 
-    filters = [
-        PreFilter("User has password set", "has_password=true"),
-        PreFilter("User has MFA set", "has_mfa=true"),
-    ]
+    filters = [PreFilter("User has password set", "has_password=true"), PreFilter("User has not enrolled in DUO MFA", "has_mfa=false"), PreFilter("User has used SSO", "saml_last_time_used is not null"), PreFilter("User appears to have an email address", "u.login_name ilike '%@%.%'")]
 
-    password = Action(
-        mk_query=lambda it: f"ALTER USER IDENTIFIER('\"{it}\"') UNSET PASSWORD",
-        btn_label="Unset password",
-    )
+    password = Action(mk_query=lambda it: f"ALTER USER IDENTIFIER('\"{it}\"') UNSET PASSWORD", btn_label="Unset password")
     to_person_type = _mk_user_type_action("PERSON")
     to_service_type = _mk_user_type_action("SERVICE")
     to_legacy_service_type = _mk_user_type_action("LEGACY_SERVICE")
@@ -157,7 +160,8 @@ def user_management():
     # UI starts here
 
     # Render pre-filters, collect checkbox status
-    st.header("Filters")
+    #st.header("Filters")
+    st.subheader("Please use the Filters and grid sorting to find users you can choose to remove passwords for or assign User Types.")
     filters = pipe(
         filters,
         cmap(cdo(PreFilter.should_be_enabled)),
@@ -199,14 +203,17 @@ def user_management():
         selection_mode="multi-row",
     )
 
-    st.header("Selected users")
+    st.subheader("Click rows, or select-all to populate the grid below and then...")
+
+#    st.header("Selected users")
     people = event.selection.rows
     st.write(data.iloc[people][show_columns])
 
     selected_users = data.iloc[people]["NAME"].tolist()
 
     # Render the UI for the actions
-    st.header("Actions")
+    #st.header("Actions")
+    st.subheader("...chose a button to take action on those users.")
     for col, action in zip(st.columns(len(actions)), actions):
         if col.button(action.btn_label):
             if len(selected_users) >= 1:
@@ -223,18 +230,21 @@ def user_management():
             else:
                 st.info("Please select at least one user")
 
+    st.subheader("Note: results from your actions won't appear above for a few hours because of the standard ACCOUNT_USAGE latency.")
+
 
 def network_rules():
     """Page with UI to create network rules."""
     query = """
     SELECT
-        client_ip,
+        client_ip,domain, name, type, country,
         count(distinct user_name) user_count,
-        listagg(distinct user_name, ', ') within group (order by user_name) as users
+        listagg(distinct user_name, ', ') within group (order by user_name) as users, 
     FROM snowflake.account_usage.login_history
+    join table(IPINFO_ALLINONE_IP_ADDRESS_DATABASE.public.IP_asn(client_ip))
     WHERE client_ip <> '0.0.0.0'
-    GROUP BY 1
-    ORDER BY user_count DESC;
+    GROUP BY 1, 2, 3, 4, 5
+    ORDER BY user_count DESC, domain;
     """
 
     @st.cache_data
@@ -245,12 +255,7 @@ def network_rules():
     st.write("Select an IP address from this list to generate the network rule")
     search_by_user = st.multiselect(
         label="Search by user",
-        options=pipe(
-            data["USERS"].tolist(),
-            cmap(lambda it: it.split(", ")),
-            lambda it: itertools.chain(*it),
-            set,
-        ),
+        options=pipe(data["USERS"].tolist(), cmap(lambda it: it.split(", ")), lambda it: itertools.chain(*it), set),
     )
 
     def _filter_by_users(row) -> bool:
@@ -259,12 +264,7 @@ def network_rules():
             return True
         # Else, filter the row value by checking if the set contains one of the selected users
         return pipe(
-            row["USERS"],
-            lambda it: it.split(", "),
-            set,
-            lambda it: it.intersection(set(search_by_user)),
-            len,
-            bool,
+            row["USERS"], lambda it: it.split(", "), set, lambda it: it.intersection(set(search_by_user)), len, bool
         )
 
     event = st.dataframe(
@@ -287,12 +287,7 @@ def network_rules():
         policy_name = c1.text_input("Name the network policy")
         # Network policy is a schema object
         target_db = c2.selectbox(
-            label="Database",
-            options=pipe(
-                "SHOW TERSE DATABASES",
-                lambda it: session.sql(it).collect(),
-                cpluck("name"),
-            ),
+            label="Database", options=pipe("SHOW TERSE DATABASES", lambda it: session.sql(it).collect(), cpluck("name"))
         )
         target_schema = c3.selectbox(
             label="Schema",
@@ -300,16 +295,14 @@ def network_rules():
                 f"SHOW TERSE SCHEMAS IN DATABASE IDENTIFIER('{target_db}')",
                 lambda it: session.sql(it).collect(),
                 cpluck("name"),
-                cfilter(
-                    lambda it: it.lower() != "information_schema"
-                ),  # INFORMATION_SCHEMA is read-only
+                cfilter(lambda it: it.lower() != "information_schema"), # INFORMATION_SCHEMA is read-only
             ),
         )
 
         if policy_name != "":
             # TODO: use rest API here when actually implementing the "GO" button
             sql = f"""
-            CREATE NETWORK RULE IDENTIFIER(\"'{target_db}.{target_schema}.network_rule_{policy_name}'\")
+            CREATE NETWORK RULE IDENTIFIER('{target_db}.{target_schema}.network_rule_{policy_name}')
                 TYPE = IPV4
                 VALUE_LIST = ({pipe(selected_ips, cmap(lambda it: f"'{it}'"), ", ".join)})
                 MODE = INGRESS
@@ -322,9 +315,8 @@ def network_rules():
 
 pipe(
     # Add pages here
-    [
-        (user_management, "User management", "person"),
-        (network_rules, "Network rules", "vpn_lock"),
+    [(user_management, "User management", "person")
+    # , (network_rules, "Network rules", "vpn_lock")
     ],
     # Transform tuples into format compatible with st.Page signature
     cmap(lambda it: {"page": it[0], "title": it[1], "icon": f":material/{it[2]}:"}),
